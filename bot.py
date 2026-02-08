@@ -31,7 +31,7 @@ CHOICES_REC = [
 ]
 
 # =========================
-# Helpers (Zeit/Daten)
+# Helpers
 # =========================
 def now_berlin() -> datetime:
     return datetime.now(tz=TZ)
@@ -174,7 +174,7 @@ async def setup_hook():
     bot.loop.create_task(reminder_loop())
 
 # =========================
-# Reminder Loop (Termine)
+# Reminder Loop
 # =========================
 async def reminder_loop():
     await bot.wait_until_ready()
@@ -257,7 +257,7 @@ def can_modify_todo(todo: Dict[str, Any], member: discord.Member) -> bool:
     return False
 
 # =========================
-# Allgemein: /ping /help
+# /ping /help
 # =========================
 @bot.tree.command(name="ping", description="Testet ob der Bot online ist")
 async def ping_cmd(interaction: discord.Interaction):
@@ -444,7 +444,7 @@ async def termin_edit_cmd(
     await interaction.followup.send(f"✅ Termin **{termin_id}** aktualisiert.", ephemeral=True)
 
 # =========================
-# Todo Slash Commands
+# Todos Slash Commands
 # =========================
 @bot.tree.command(name="todo", description="Erstellt ein Todo (public/private/user/role)")
 @app_commands.describe(
@@ -674,7 +674,7 @@ async def todo_edit_cmd(
     await interaction.followup.send(f"✅ Todo **{todo_id}** aktualisiert.", ephemeral=True)
 
 # ============================================================
-# DASHBOARD (public message, nur Owner bedienbar)
+# DASHBOARD
 # ============================================================
 def dash_filter(member: discord.Member, tab: str) -> List[Dict[str, Any]]:
     data = load_data()
@@ -771,22 +771,35 @@ def find_todo(data: Dict[str, Any], tid: int) -> Optional[Dict[str, Any]]:
 def find_event(data: Dict[str, Any], eid: int) -> Optional[Dict[str, Any]]:
     return next((e for e in data["events"] if int(e.get("id",-1)) == eid), None)
 
-# ---------- Modals ----------
+# ============================================================
+# Modals (max 5 inputs)
+# ============================================================
 class AddTodoModal(discord.ui.Modal, title="Todo hinzufügen"):
-    def __init__(self, view: "DashboardView"):
+    def __init__(self, parent: "DashboardView", picked_user_id: Optional[int], picked_role_id: Optional[int]):
         super().__init__(timeout=300)
-        self.view_ref = view
+        self.parent = parent
+        self.picked_user_id = picked_user_id
+        self.picked_role_id = picked_role_id
+
         self.titel = discord.ui.TextInput(label="Titel", required=True, max_length=120)
         self.desc = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=500)
         self.scope = discord.ui.TextInput(label="Scope (public/private/user/role)", default="public", required=False, max_length=10)
-        self.user_id = discord.ui.TextInput(label="User ID (nur scope=user)", required=False, max_length=30)
-        self.role_id = discord.ui.TextInput(label="Role ID (nur scope=role)", required=False, max_length=30)
         self.due = discord.ui.TextInput(label="Fälligkeit (DD.MM.YYYY HH:MM) oder leer", required=False, max_length=20)
-        for x in (self.titel, self.desc, self.scope, self.user_id, self.role_id, self.due):
+        hint = "Ausgewählt: "
+        if picked_user_id:
+            hint += "User"
+        elif picked_role_id:
+            hint += "Role"
+        else:
+            hint += "—"
+        self.note = discord.ui.TextInput(label=f"Ziel aus Dropdown wird benutzt ({hint})", default="", required=False, max_length=1)
+
+        # Trick: "note" ist nur zur Info; wird ignoriert. Muss aber <=5 bleiben.
+        for x in (self.titel, self.desc, self.scope, self.due, self.note):
             self.add_item(x)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.view_ref.owner_id:
+        if interaction.user.id != self.parent.owner_id:
             return await interaction.response.send_message("❌ Nicht dein Dashboard.", ephemeral=True)
 
         scope = (self.scope.value or "public").strip().lower()
@@ -795,13 +808,17 @@ class AddTodoModal(discord.ui.Modal, title="Todo hinzufügen"):
 
         au = ar = None
         if scope == "user":
-            try: au = int((self.user_id.value or "").strip())
-            except: au = None
+            au = self.picked_user_id
         if scope == "role":
-            try: ar = int((self.role_id.value or "").strip())
-            except: ar = None
+            ar = self.picked_role_id
         if scope in ("public","private"):
             au = ar = None
+
+        # Validierung: wenn scope user/role -> Auswahl nötig
+        if scope == "user" and not au:
+            return await interaction.response.send_message("❌ Für scope **user** bitte im Dropdown einen User auswählen.", ephemeral=True)
+        if scope == "role" and not ar:
+            return await interaction.response.send_message("❌ Für scope **role** bitte im Dropdown eine Rolle auswählen.", ephemeral=True)
 
         due_iso = None
         raw = (self.due.value or "").strip()
@@ -810,7 +827,7 @@ class AddTodoModal(discord.ui.Modal, title="Todo hinzufügen"):
                 dpart, tpart = raw.split()
                 due_iso = dt_to_iso(parse_date_time(dpart, tpart))
             except:
-                due_iso = None
+                return await interaction.response.send_message("❌ Fälligkeit ungültig. Beispiel: 10.03.2026 18:00", ephemeral=True)
 
         data = load_data()
         tid = new_todo_id(data)
@@ -831,23 +848,25 @@ class AddTodoModal(discord.ui.Modal, title="Todo hinzufügen"):
         save_data(data)
 
         await interaction.response.send_message(f"✅ Todo **{tid}** erstellt.", ephemeral=True)
-        await self.view_ref.refresh_message()
+        await self.parent.refresh_message()
 
 class AddEventModal(discord.ui.Modal, title="Termin hinzufügen"):
-    def __init__(self, view: "DashboardView"):
+    def __init__(self, parent: "DashboardView", picked_dm_user_ids: List[int]):
         super().__init__(timeout=300)
-        self.view_ref = view
+        self.parent = parent
+        self.picked_dm_user_ids = picked_dm_user_ids[:]  # aus Selector
+
         self.title_in = discord.ui.TextInput(label="Titel", required=True, max_length=120)
         self.dt_in = discord.ui.TextInput(label="Datum/Zeit (DD.MM.YYYY HH:MM)", required=True, max_length=20)
         self.rems_in = discord.ui.TextInput(label="Erinnerungen (z.B. 60,10,5)", default="30", required=False, max_length=60)
-        self.rec_in = discord.ui.TextInput(label="Wiederholung (none/daily/weekly/monthly)", default="none", required=False, max_length=10)
-        self.target_in = discord.ui.TextInput(label="Target (channel/dm)", default="channel", required=False, max_length=10)
-        self.dm_user_ids = discord.ui.TextInput(label="DM User IDs (kommagetrennt; nur target=dm)", required=False, max_length=200)
-        for x in (self.title_in, self.dt_in, self.rems_in, self.rec_in, self.target_in, self.dm_user_ids):
+        self.rec_target = discord.ui.TextInput(label="Wiederholung+Target (z.B. 'none channel' oder 'weekly dm')", default="none channel", required=False, max_length=40)
+        hint = f"{len(picked_dm_user_ids)} DM-Empfänger ausgewählt"
+        self.note = discord.ui.TextInput(label=hint, default="", required=False, max_length=1)
+        for x in (self.title_in, self.dt_in, self.rems_in, self.rec_target, self.note):
             self.add_item(x)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.view_ref.owner_id:
+        if interaction.user.id != self.parent.owner_id:
             return await interaction.response.send_message("❌ Nicht dein Dashboard.", ephemeral=True)
 
         title = self.title_in.value.strip()
@@ -858,26 +877,23 @@ class AddEventModal(discord.ui.Modal, title="Termin hinzufügen"):
             return await interaction.response.send_message("❌ Datum/Zeit ungültig. Beispiel: 08.02.2026 12:00", ephemeral=True)
 
         rems = parse_reminders(self.rems_in.value or "30")
-        rec = (self.rec_in.value or "none").strip().lower()
-        if rec not in ("none","daily","weekly","monthly"):
-            rec = "none"
 
-        target = (self.target_in.value or "channel").strip().lower()
-        if target not in ("channel","dm"):
-            target = "channel"
+        rec = "none"
+        target = "channel"
+        rt = (self.rec_target.value or "").strip().lower()
+        if rt:
+            parts = [p for p in rt.split() if p]
+            if len(parts) >= 1 and parts[0] in ("none","daily","weekly","monthly"):
+                rec = parts[0]
+            if len(parts) >= 2 and parts[1] in ("channel","dm"):
+                target = parts[1]
 
         data = load_data()
         eid = new_event_id(data)
 
         if target == "dm":
-            ids = {interaction.user.id}
-            raw = (self.dm_user_ids.value or "").strip()
-            if raw:
-                for p in raw.split(","):
-                    p = p.strip()
-                    if not p: continue
-                    try: ids.add(int(p))
-                    except: pass
+            ids = set(self.picked_dm_user_ids)
+            ids.add(interaction.user.id)  # immer Ersteller dazu
             tgt_obj = {"type":"dm", "user_ids": sorted(list(ids))}
         else:
             tgt_obj = {"type":"channel", "channel_id": ERINNERUNGS_CHANNEL_ID}
@@ -904,138 +920,72 @@ class AddEventModal(discord.ui.Modal, title="Termin hinzufügen"):
             )
 
         await interaction.response.send_message(f"✅ Termin **{eid}** erstellt ({target}).", ephemeral=True)
-        await self.view_ref.refresh_message()
+        await self.parent.refresh_message()
 
-class TodoEditModal(discord.ui.Modal, title="Todo bearbeiten"):
-    def __init__(self, view: "DashboardView", todo_id: int):
-        super().__init__(timeout=300)
-        self.view_ref = view
-        self.todo_id = todo_id
+# ============================================================
+# Dashboard Picker Views (User/Role Select)
+# ============================================================
+class TodoTargetSelect(discord.ui.MentionableSelect):
+    def __init__(self):
+        super().__init__(placeholder="Optional: User oder Rolle auswählen…", min_values=0, max_values=1)
 
-        data = load_data()
-        t = next((x for x in data["todos"] if int(x.get("id",-1)) == todo_id and not x.get("deleted")), {}) or {}
-        self.title_in = discord.ui.TextInput(label="Titel", default=t.get("title",""), required=False, max_length=120)
-        self.desc_in = discord.ui.TextInput(label="Beschreibung", default=t.get("description",""), style=discord.TextStyle.paragraph, required=False, max_length=500)
-        self.scope_in = discord.ui.TextInput(label="Scope (public/private/user/role)", default=t.get("scope","public"), required=False, max_length=10)
-        self.user_id_in = discord.ui.TextInput(label="Assigned User ID (scope=user)", default=str(t.get("assigned_user_id") or ""), required=False, max_length=30)
-        self.role_id_in = discord.ui.TextInput(label="Assigned Role ID (scope=role)", default=str(t.get("assigned_role_id") or ""), required=False, max_length=30)
+class EventDMUserSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="Optional: DM-Empfänger auswählen (mehrere)…", min_values=0, max_values=10)
 
-        due_default = ""
-        if t.get("due"):
-            try: due_default = dt_from_iso(t["due"]).strftime("%d.%m.%Y %H:%M")
-            except: pass
-        self.due_in = discord.ui.TextInput(label="Fälligkeit (DD.MM.YYYY HH:MM) oder leer", default=due_default, required=False, max_length=20)
+class TodoCreatePickView(discord.ui.View):
+    def __init__(self, parent: "DashboardView"):
+        super().__init__(timeout=120)
+        self.parent = parent
+        self.picked_user_id: Optional[int] = None
+        self.picked_role_id: Optional[int] = None
+        self.select = TodoTargetSelect()
+        self.select.callback = self.on_select
+        self.add_item(self.select)
 
-        for x in (self.title_in, self.desc_in, self.scope_in, self.user_id_in, self.role_id_in, self.due_in):
-            self.add_item(x)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.view_ref.owner_id:
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent.owner_id:
             return await interaction.response.send_message("❌ Nicht dein Dashboard.", ephemeral=True)
-        if not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("❌ Bitte im Server ausführen.", ephemeral=True)
+        self.picked_user_id = None
+        self.picked_role_id = None
+        if self.select.values:
+            v = self.select.values[0]
+            if isinstance(v, discord.Member) or isinstance(v, discord.User):
+                self.picked_user_id = v.id
+            elif isinstance(v, discord.Role):
+                self.picked_role_id = v.id
+        await interaction.response.defer(ephemeral=True)
 
-        data = load_data()
-        todo = find_todo(data, self.todo_id)
-        if not todo:
-            return await interaction.response.send_message("❌ Todo nicht gefunden.", ephemeral=True)
-        if not can_modify_todo(todo, interaction.user):
-            return await interaction.response.send_message("❌ Keine Rechte.", ephemeral=True)
-
-        if self.title_in.value.strip():
-            todo["title"] = self.title_in.value.strip()
-        todo["description"] = (self.desc_in.value or "").strip()
-
-        scope = (self.scope_in.value or "").strip().lower()
-        if scope not in ("public","private","user","role"):
-            scope = todo.get("scope","public")
-        todo["scope"] = scope
-
-        if scope in ("public","private"):
-            todo["assigned_user_id"] = None
-            todo["assigned_role_id"] = None
-        elif scope == "user":
-            try:
-                todo["assigned_user_id"] = int((self.user_id_in.value or "").strip())
-                todo["assigned_role_id"] = None
-            except: pass
-        elif scope == "role":
-            try:
-                todo["assigned_role_id"] = int((self.role_id_in.value or "").strip())
-                todo["assigned_user_id"] = None
-            except: pass
-
-        raw = (self.due_in.value or "").strip()
-        if raw == "":
-            todo["due"] = None
-        else:
-            try:
-                dpart, tpart = raw.split()
-                todo["due"] = dt_to_iso(parse_date_time(dpart, tpart))
-            except: pass
-
-        save_data(data)
-        await interaction.response.send_message(f"✅ Todo {self.todo_id} gespeichert.", ephemeral=True)
-        await self.view_ref.refresh_message()
-
-class EventEditModal(discord.ui.Modal, title="Termin bearbeiten"):
-    def __init__(self, view: "DashboardView", event_id: int):
-        super().__init__(timeout=300)
-        self.view_ref = view
-        self.event_id = event_id
-
-        data = load_data()
-        e = find_event(data, event_id) or {}
-
-        dt_default = ""
-        if e.get("datetime"):
-            try: dt_default = dt_from_iso(e["datetime"]).strftime("%d.%m.%Y %H:%M")
-            except: pass
-
-        self.title_in = discord.ui.TextInput(label="Titel", default=e.get("title",""), required=False, max_length=120)
-        self.dt_in = discord.ui.TextInput(label="Datum/Zeit (DD.MM.YYYY HH:MM)", default=dt_default, required=False, max_length=20)
-        self.rems_in = discord.ui.TextInput(label="Erinnerungen (z.B. 60,10,5)", default=",".join(str(x) for x in e.get("reminders", [])), required=False, max_length=60)
-        self.rec_in = discord.ui.TextInput(label="Wiederholung (none/daily/weekly/monthly)", default=e.get("recurrence","none"), required=False, max_length=10)
-
-        for x in (self.title_in, self.dt_in, self.rems_in, self.rec_in):
-            self.add_item(x)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if interaction.user.id != self.view_ref.owner_id:
+    @discord.ui.button(label="Weiter (Modal öffnen)", style=discord.ButtonStyle.success)
+    async def go(self, interaction: discord.Interaction, _):
+        if interaction.user.id != self.parent.owner_id:
             return await interaction.response.send_message("❌ Nicht dein Dashboard.", ephemeral=True)
+        await interaction.response.send_modal(AddTodoModal(self.parent, self.picked_user_id, self.picked_role_id))
 
-        data = load_data()
-        ev = find_event(data, self.event_id)
-        if not ev:
-            return await interaction.response.send_message("❌ Termin nicht gefunden.", ephemeral=True)
+class EventCreatePickView(discord.ui.View):
+    def __init__(self, parent: "DashboardView"):
+        super().__init__(timeout=120)
+        self.parent = parent
+        self.picked_ids: List[int] = []
+        self.select = EventDMUserSelect()
+        self.select.callback = self.on_select
+        self.add_item(self.select)
 
-        if self.title_in.value.strip():
-            ev["title"] = self.title_in.value.strip()
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent.owner_id:
+            return await interaction.response.send_message("❌ Nicht dein Dashboard.", ephemeral=True)
+        self.picked_ids = [u.id for u in self.select.values] if self.select.values else []
+        await interaction.response.defer(ephemeral=True)
 
-        raw_dt = (self.dt_in.value or "").strip()
-        if raw_dt:
-            try:
-                dpart, tpart = raw_dt.split()
-                ev["datetime"] = dt_to_iso(parse_date_time(dpart, tpart))
-                ev["sent"] = []
-            except: pass
+    @discord.ui.button(label="Weiter (Modal öffnen)", style=discord.ButtonStyle.success)
+    async def go(self, interaction: discord.Interaction, _):
+        if interaction.user.id != self.parent.owner_id:
+            return await interaction.response.send_message("❌ Nicht dein Dashboard.", ephemeral=True)
+        await interaction.response.send_modal(AddEventModal(self.parent, self.picked_ids))
 
-        rem_raw = (self.rems_in.value or "").strip()
-        if rem_raw != "":
-            try:
-                ev["reminders"] = parse_reminders(rem_raw)
-                ev["sent"] = []
-            except: pass
-
-        rec = (self.rec_in.value or "").strip().lower()
-        if rec in ("none","daily","weekly","monthly"):
-            ev["recurrence"] = rec
-
-        save_data(data)
-        await interaction.response.send_message(f"✅ Termin {self.event_id} gespeichert.", ephemeral=True)
-        await self.view_ref.refresh_message()
-
-# ---------- View + Select ----------
+# ============================================================
+# Dashboard View (mit Buttons/Dropdown/Pagination)
+# ============================================================
 class DashSelect(discord.ui.Select):
     def __init__(self, view: "DashboardView"):
         self.v = view
@@ -1113,11 +1063,20 @@ class DashboardView(discord.ui.View):
 
     @discord.ui.button(label="➕ Todo", style=discord.ButtonStyle.success, row=2)
     async def add_todo(self, interaction: discord.Interaction, _):
-        await interaction.response.send_modal(AddTodoModal(self))
+        # Ephemeral Picker -> dann Modal
+        await interaction.response.send_message(
+            "Wähle optional **User oder Rolle** (für scope=user/role) und klicke **Weiter**.",
+            ephemeral=True,
+            view=TodoCreatePickView(self)
+        )
 
     @discord.ui.button(label="➕ Termin", style=discord.ButtonStyle.success, row=2)
     async def add_event(self, interaction: discord.Interaction, _):
-        await interaction.response.send_modal(AddEventModal(self))
+        await interaction.response.send_message(
+            "Wähle optional **DM-Empfänger** (für target=dm) und klicke **Weiter**.",
+            ephemeral=True,
+            view=EventCreatePickView(self)
+        )
 
     @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
     async def ref(self, interaction: discord.Interaction, _):
@@ -1173,9 +1132,7 @@ class DashboardView(discord.ui.View):
 
     @discord.ui.button(label="✏️ Edit Todo", style=discord.ButtonStyle.secondary, row=3)
     async def todo_edit_btn(self, interaction: discord.Interaction, _):
-        if not self.tab.startswith("todos") or not self.selected_id:
-            return await interaction.response.send_message("❌ Erst ein Todo auswählen.", ephemeral=True)
-        await interaction.response.send_modal(TodoEditModal(self, self.selected_id))
+        return await interaction.response.send_message("ℹ️ Todo-Edit per **/todo_edit** (mit User/Role Auswahl über Discord UI).", ephemeral=True)
 
     # Event actions
     @discord.ui.button(label="❌ Absagen", style=discord.ButtonStyle.danger, row=4)
@@ -1193,28 +1150,23 @@ class DashboardView(discord.ui.View):
 
     @discord.ui.button(label="✏️ Edit Termin", style=discord.ButtonStyle.secondary, row=4)
     async def event_edit_btn(self, interaction: discord.Interaction, _):
-        if not self.tab.startswith("events") or not self.selected_id:
-            return await interaction.response.send_message("❌ Erst einen Termin auswählen.", ephemeral=True)
-        await interaction.response.send_modal(EventEditModal(self, self.selected_id))
+        return await interaction.response.send_message("ℹ️ Termin-Edit per **/termin_edit** (Datum/Zeit/Reminder/Wiederholung).", ephemeral=True)
 
 # =========================
-# /dashboard  (Dashboard wird nach 15min gelöscht)
+# /dashboard (wird nach 15min gelöscht)
 # =========================
 @bot.tree.command(name="dashboard", description="Interaktives Dashboard (Todos + Termine)")
 async def dashboard_cmd(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("❌ Bitte im Server ausführen.", ephemeral=True)
 
-    ch = None
-    if DASHBOARD_CHANNEL_ID:
-        ch = bot.get_channel(DASHBOARD_CHANNEL_ID) or await bot.fetch_channel(DASHBOARD_CHANNEL_ID)
-    else:
+    ch = bot.get_channel(DASHBOARD_CHANNEL_ID) if DASHBOARD_CHANNEL_ID else interaction.channel
+    if not ch:
         ch = interaction.channel
 
     await interaction.response.send_message("✅ Dashboard wird gepostet (nur du kannst es bedienen).", ephemeral=True)
 
     emb = dash_embed(interaction.user, "todos_open", 0, None)
-    # ✅ WICHTIG: delete_after=AUTO_DELETE_SECONDS -> Dashboard nach 15min weg
     msg = await ch.send(embed=emb, delete_after=AUTO_DELETE_SECONDS)
     view = DashboardView(interaction.user, msg, "todos_open", 0, None)
     await msg.edit(view=view)
