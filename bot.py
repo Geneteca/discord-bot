@@ -15,8 +15,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ERINNERUNGS_CHANNEL_ID = int(os.environ["ERINNERUNGS_CHANNEL_ID"])
 TZ = ZoneInfo("Europe/Berlin")
 
-# WICHTIG: MUSS gesetzt sein!
+# MUSS gesetzt sein, damit Guild-Sync sofort ist
 GUILD_ID = int(os.environ["GUILD_ID"])
+
+# Einmaliger Cleanup globaler Commands (1 = aktiv)
+CLEAN_GLOBAL_COMMANDS = os.environ.get("CLEAN_GLOBAL_COMMANDS", "0").strip() == "1"
 
 DATA_FILE = "data.json"
 CHECK_INTERVAL_SECONDS = 20
@@ -71,16 +74,29 @@ class Bot(discord.Client):
     async def setup_hook(self):
         guild = discord.Object(id=GUILD_ID)
 
-        # 👉 TEMPORÄR: GLOBALE COMMANDS LÖSCHEN
-        print("🧹 Entferne globale Slash-Commands …", flush=True)
-        self.tree.clear_commands(guild=None)
-        await self.tree.sync()
-        print("✅ Globale Slash-Commands gelöscht", flush=True)
-
-        # Guild Commands setzen
-        self.tree.copy_global_to(guild=guild)
+        # ✅ 1) Erst Guild syncen (damit Commands sicher vorhanden sind)
         await self.tree.sync(guild=guild)
         print(f"✅ Guild Slash-Commands synced ({GUILD_ID})", flush=True)
+
+        # ✅ 2) Optional: globale Commands EINMAL löschen
+        if CLEAN_GLOBAL_COMMANDS:
+            print("🧹 Entferne globale Slash-Commands …", flush=True)
+
+            # Merke lokale Commands
+            saved_cmds = list(self.tree.get_commands())
+
+            # Entferne lokal + sync global -> löscht remote globale Commands
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            print("✅ Globale Slash-Commands gelöscht", flush=True)
+
+            # Füge lokale Commands wieder hinzu (damit Bot sie weiterhin hat)
+            for c in saved_cmds:
+                self.tree.add_command(c)
+
+            # Guild nochmal syncen, damit garantiert alles da ist
+            await self.tree.sync(guild=guild)
+            print(f"✅ Guild Slash-Commands re-synced ({GUILD_ID})", flush=True)
 
 bot = Bot()
 
@@ -90,7 +106,6 @@ bot = Bot()
 async def reminder_loop():
     await bot.wait_until_ready()
     channel = bot.get_channel(ERINNERUNGS_CHANNEL_ID)
-
     print("⏰ Reminder Loop aktiv", flush=True)
 
     while True:
@@ -114,7 +129,8 @@ async def reminder_loop():
                     )
 
                     if e["target"]["type"] == "channel":
-                        await channel.send(text)
+                        if channel:
+                            await channel.send(text)
                     else:
                         for uid in e["target"]["users"]:
                             user = await bot.fetch_user(uid)
@@ -167,17 +183,14 @@ async def termin(
         "sent": [],
         "repeat": wiederholung,
         "cancelled": False,
-        "target": {
-            "type": "channel"
-        }
+        "target": {"type": "channel"}
     }
 
     data["events"].append(e)
     save_data(data)
-
     await interaction.followup.send("✅ Öffentlicher Termin gespeichert", ephemeral=True)
 
-@bot.tree.command(name="ptermin", description="Privater Termin per DM")
+@bot.tree.command(name="ptermin", description="Privater Termin per DM (an dich + ausgewählte Personen)")
 async def ptermin(
     interaction: discord.Interaction,
     datum: str,
@@ -186,11 +199,14 @@ async def ptermin(
     erinnerungen: str = "30",
     person1: Optional[discord.Member] = None,
     person2: Optional[discord.Member] = None,
+    person3: Optional[discord.Member] = None,
+    person4: Optional[discord.Member] = None,
+    person5: Optional[discord.Member] = None,
 ):
     await interaction.response.defer(ephemeral=True)
 
     users = {interaction.user.id}
-    for p in (person1, person2):
+    for p in (person1, person2, person3, person4, person5):
         if p:
             users.add(p.id)
 
@@ -205,16 +221,13 @@ async def ptermin(
         "sent": [],
         "repeat": "none",
         "cancelled": False,
-        "target": {
-            "type": "dm",
-            "users": list(users)
-        }
+        "target": {"type": "dm", "users": list(users)}
     }
 
     data["events"].append(e)
     save_data(data)
 
-    await interaction.followup.send("📩 Privater Termin gespeichert (DM)", ephemeral=True)
+    await interaction.followup.send("📩 Privater Termin gespeichert (DM an alle ausgewählten)", ephemeral=True)
 
 # =========================
 # START
@@ -224,4 +237,5 @@ async def main():
         bot.loop.create_task(reminder_loop())
         await bot.start(BOT_TOKEN)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
