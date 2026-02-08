@@ -119,13 +119,13 @@ def build_reminder_message(title: str, dt: datetime, minutes_before: int) -> str
     )
 
 # =========================
-# Bot (Slash-only)
+# Bot
 # =========================
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)  # Prefix wird nicht genutzt, nur stabiler Wrapper für tree
+bot = commands.Bot(command_prefix="!", intents=intents)  # Prefix wird nicht genutzt; Slash läuft über bot.tree
 
 async def send_channel_message(channel_id: int, content: str):
     ch = bot.get_channel(channel_id)
@@ -162,6 +162,7 @@ async def reminder_loop():
                 reminders: List[int] = [int(x) for x in ev.get("reminders", [])]
                 sent = set(int(x) for x in ev.get("sent", []))
 
+                # Erinnerungen senden
                 for m in reminders:
                     if m in sent:
                         continue
@@ -169,8 +170,10 @@ async def reminder_loop():
                         msg = build_reminder_message(ev["title"], dt, m)
 
                         if ev["target"]["type"] == "channel":
+                            # ✅ Rollen-Ping nur im Channel
                             await send_channel_message(ev["target"]["channel_id"], f"<@&{ROLLE_ID}> {msg}")
                         else:
+                            # ✅ DM ohne Ping
                             for uid in ev["target"]["user_ids"]:
                                 await send_dm(uid, msg)
 
@@ -178,6 +181,7 @@ async def reminder_loop():
                         ev["sent"] = sorted(list(sent), reverse=True)
                         changed = True
 
+                # Terminzeit vorbei -> wiederkehrend oder abschließen
                 if now >= dt:
                     rec = (ev.get("recurrence") or "none").lower()
                     if rec != "none":
@@ -196,13 +200,10 @@ async def reminder_loop():
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # =========================
-# Sync + Debug (entscheidend)
+# Sync (FIX: copy_global_to)
 # =========================
-async def do_sync_and_debug():
+async def do_sync():
     guild = discord.Object(id=GUILD_ID)
-
-    local_cmds = [c.name for c in bot.tree.get_commands()]
-    print(f"🔍 Lokal registrierte Commands (vor sync): {local_cmds}", flush=True)
 
     if CLEAN_GLOBAL_COMMANDS:
         print("🧹 CLEAN_GLOBAL_COMMANDS: Lösche globale Slash-Commands …", flush=True)
@@ -210,23 +211,18 @@ async def do_sync_and_debug():
         await bot.tree.sync()
         print("✅ Globale Slash-Commands gelöscht.", flush=True)
 
+    # 🔥 WICHTIG: globale Commands in die Guild kopieren
+    bot.tree.copy_global_to(guild=guild)
+
     await bot.tree.sync(guild=guild)
     print(f"✅ Slash-Commands synced to guild {GUILD_ID}", flush=True)
 
     remote = await bot.tree.fetch_commands(guild=guild)
-    remote_names = [c.name for c in remote]
-    print(f"📌 Remote Commands (Guild): {remote_names}", flush=True)
-
-    if not local_cmds:
-        print("❗ WARNUNG: Keine lokalen Slash-Commands gefunden! "
-              "Dann wurden die @bot.tree.command Definitionen beim Import nicht registriert.", flush=True)
-    if local_cmds and not remote_names:
-        print("❗ WARNUNG: Lokale Commands sind da, aber Remote ist leer. "
-              "Dann ist es sehr wahrscheinlich ein Installations/Scope/Discord-Problem.", flush=True)
+    print(f"📌 Remote Commands (Guild): {[c.name for c in remote]}", flush=True)
 
 @bot.event
 async def setup_hook():
-    await do_sync_and_debug()
+    await do_sync()
     bot.loop.create_task(reminder_loop())
 
 # =========================
@@ -250,6 +246,7 @@ async def termin_cmd(
     wiederholung: str = "none",
 ):
     await interaction.response.defer(ephemeral=True)
+
     try:
         dt = parse_date_time(datum, uhrzeit)
     except Exception:
@@ -257,6 +254,7 @@ async def termin_cmd(
         return
 
     reminders = parse_reminders(erinnerung)
+
     data = load_data()
     eid = new_id(data)
 
@@ -312,6 +310,7 @@ async def ptermin_cmd(
     person5: Optional[discord.Member] = None,
 ):
     await interaction.response.defer(ephemeral=True)
+
     try:
         dt = parse_date_time(datum, uhrzeit)
     except Exception:
@@ -319,6 +318,7 @@ async def ptermin_cmd(
         return
 
     reminders = parse_reminders(erinnerung)
+
     ids = {interaction.user.id}
     for p in (person1, person2, person3, person4, person5):
         if p:
