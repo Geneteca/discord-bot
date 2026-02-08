@@ -6,8 +6,12 @@ from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any
 
 import discord
+from discord.ext import commands
 from discord import app_commands
 
+# =========================
+# ENV / KONFIG
+# =========================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ERINNERUNGS_CHANNEL_ID = int(os.environ["ERINNERUNGS_CHANNEL_ID"])
 ROLLE_ID = int(os.environ["ROLLE_ID"])
@@ -16,9 +20,19 @@ CLEAN_GLOBAL_COMMANDS = os.environ.get("CLEAN_GLOBAL_COMMANDS", "0").strip() == 
 
 TZ = ZoneInfo("Europe/Berlin")
 DATA_FILE = "data.json"
-AUTO_DELETE_SECONDS = 900
+AUTO_DELETE_SECONDS = 900  # 15 Minuten
 CHECK_INTERVAL_SECONDS = 20
 
+CHOICES_REC = [
+    app_commands.Choice(name="none", value="none"),
+    app_commands.Choice(name="daily", value="daily"),
+    app_commands.Choice(name="weekly", value="weekly"),
+    app_commands.Choice(name="monthly", value="monthly"),
+]
+
+# =========================
+# Daten / Helpers
+# =========================
 def now_berlin() -> datetime:
     return datetime.now(tz=TZ)
 
@@ -34,10 +48,19 @@ def dt_from_iso(s: str) -> datetime:
     return dt.astimezone(TZ)
 
 def parse_date_time(date_str: str, time_str: str) -> datetime:
+    # DD.MM.YYYY + HH:MM
     naive = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
     return naive.replace(tzinfo=TZ)
 
 def parse_reminders(rem_str: str) -> List[int]:
+    """
+    Beispiele:
+      "60,10,5"
+      "1h,10m"
+      "30"
+      "1d"
+    -> Minuten (unique, absteigend)
+    """
     rem_str = (rem_str or "").strip()
     if not rem_str:
         return []
@@ -74,17 +97,18 @@ def new_id(data: Dict[str, Any]) -> int:
     return nid
 
 def add_month(dt: datetime) -> datetime:
-    y = dt.year
-    m = dt.month + 1
+    y, m = dt.year, dt.month + 1
     if m == 13:
         y += 1
         m = 1
 
+    # letzter Tag im Zielmonat
     if m == 12:
         next_month = datetime(y + 1, 1, 1, tzinfo=dt.tzinfo)
     else:
         next_month = datetime(y, m + 1, 1, tzinfo=dt.tzinfo)
     last_day = (next_month - timedelta(days=1)).day
+
     return dt.replace(year=y, month=m, day=min(dt.day, last_day))
 
 def next_occurrence(dt: datetime, recurrence: str) -> datetime:
@@ -97,6 +121,23 @@ def next_occurrence(dt: datetime, recurrence: str) -> datetime:
         return add_month(dt)
     return dt
 
+def build_reminder_message(title: str, dt: datetime, minutes_before: int) -> str:
+    when = dt.strftime("%d.%m.%Y %H:%M")
+    return (
+        f"🔔 **Erinnerung** ({minutes_before} min vorher)\n"
+        f"📌 **{title}**\n"
+        f"🕒 {when} (Berlin)"
+    )
+
+# =========================
+# Bot
+# =========================
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)  # Prefix wird nicht genutzt, aber Bot ist stabil für tree
+
 async def send_channel_message(channel_id: int, content: str):
     ch = bot.get_channel(channel_id)
     if ch is None:
@@ -107,39 +148,39 @@ async def send_dm(user_id: int, content: str):
     user = bot.get_user(user_id) or await bot.fetch_user(user_id)
     await user.send(content)
 
-def build_reminder_message(title: str, dt: datetime, minutes_before: int) -> str:
-    when = dt.strftime("%d.%m.%Y %H:%M")
-    return (
-        f"🔔 **Erinnerung** ({minutes_before} min vorher)\n"
-        f"📌 **{title}**\n"
-        f"🕒 {when} (Berlin)"
-    )
+@bot.event
+async def on_ready():
+    print(f"✅ Bot online als {bot.user}", flush=True)
 
-class MyBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.guilds = True
-        intents.members = True
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+# =========================
+# setup_hook: Sync + Remote-Verify
+# =========================
+async def do_sync():
+    guild = discord.Object(id=GUILD_ID)
 
-    async def setup_hook(self):
-        guild = discord.Object(id=GUILD_ID)
+    # Optional: globale Commands 1x löschen
+    if CLEAN_GLOBAL_COMMANDS:
+        print("🧹 CLEAN_GLOBAL_COMMANDS: Lösche globale Slash-Commands …", flush=True)
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()  # global leer syncen => entfernt globale remote
+        print("✅ Globale Slash-Commands gelöscht.", flush=True)
 
-        if CLEAN_GLOBAL_COMMANDS:
-            print("🧹 CLEAN_GLOBAL_COMMANDS aktiv: Lösche globale Slash-Commands …", flush=True)
-            saved_cmds = list(self.tree.get_commands())
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()  # global remote löschen
-            for c in saved_cmds:
-                self.tree.add_command(c)
-            print("✅ Globale Slash-Commands gelöscht.", flush=True)
+    await bot.tree.sync(guild=guild)
+    print(f"✅ Slash-Commands synced to guild {GUILD_ID}", flush=True)
 
-        await self.tree.sync(guild=guild)
-        print(f"✅ Slash-Commands synced to guild {GUILD_ID}", flush=True)
+    # ✅ Beweis ins Log: Welche Commands sind remote wirklich vorhanden?
+    remote = await bot.tree.fetch_commands(guild=guild)
+    names = [c.name for c in remote]
+    print(f"📌 Remote Commands (Guild): {names}", flush=True)
 
-bot = MyBot()
+@bot.event
+async def setup_hook():
+    await do_sync()
+    bot.loop.create_task(reminder_loop())
 
+# =========================
+# Reminder Loop
+# =========================
 async def reminder_loop():
     await bot.wait_until_ready()
     print("⏰ Reminder-Loop aktiv", flush=True)
@@ -156,31 +197,36 @@ async def reminder_loop():
 
                 dt = dt_from_iso(ev["datetime"])
                 reminders: List[int] = [int(x) for x in ev.get("reminders", [])]
-                sent_set = set(int(x) for x in ev.get("sent", []))
+                sent = set(int(x) for x in ev.get("sent", []))
 
                 for m in reminders:
-                    if m in sent_set:
+                    if m in sent:
                         continue
+
                     if now >= (dt - timedelta(minutes=m)) and now < dt + timedelta(hours=24):
-                        text = build_reminder_message(ev["title"], dt, m)
+                        msg = build_reminder_message(ev["title"], dt, m)
+
                         if ev["target"]["type"] == "channel":
-                            await send_channel_message(ev["target"]["channel_id"], f"<@&{ROLLE_ID}> " + text)
+                            # ✅ Rollen-Ping nur im Channel
+                            await send_channel_message(ev["target"]["channel_id"], f"<@&{ROLLE_ID}> {msg}")
                         else:
+                            # ✅ DM ohne Ping
                             for uid in ev["target"]["user_ids"]:
-                                await send_dm(uid, text)
-                        sent_set.add(m)
-                        ev["sent"] = sorted(list(sent_set), reverse=True)
+                                await send_dm(uid, msg)
+
+                        sent.add(m)
+                        ev["sent"] = sorted(list(sent), reverse=True)
                         changed = True
 
+                # Zeitpunkt vorbei: wiederkehrend oder abschließen
                 if now >= dt:
                     rec = (ev.get("recurrence") or "none").lower()
                     if rec != "none":
                         ev["datetime"] = dt_to_iso(next_occurrence(dt, rec))
                         ev["sent"] = []
-                        changed = True
                     else:
                         ev["cancelled"] = True
-                        changed = True
+                    changed = True
 
             if changed:
                 save_data(data)
@@ -190,13 +236,9 @@ async def reminder_loop():
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-CHOICES_REC = [
-    app_commands.Choice(name="none", value="none"),
-    app_commands.Choice(name="daily", value="daily"),
-    app_commands.Choice(name="weekly", value="weekly"),
-    app_commands.Choice(name="monthly", value="monthly"),
-]
-
+# =========================
+# Slash Commands
+# =========================
 @bot.tree.command(name="termin", description="Öffentlicher Termin (Channel) mit Rollen-Ping")
 @app_commands.describe(
     datum="DD.MM.YYYY (z.B. 08.02.2026)",
@@ -215,6 +257,7 @@ async def termin_cmd(
     wiederholung: str = "none",
 ):
     await interaction.response.defer(ephemeral=True)
+
     try:
         dt = parse_date_time(datum, uhrzeit)
     except Exception:
@@ -222,9 +265,9 @@ async def termin_cmd(
         return
 
     reminders = parse_reminders(erinnerung)
+
     data = load_data()
     eid = new_id(data)
-
     data["events"].append({
         "id": eid,
         "title": titel,
@@ -277,6 +320,7 @@ async def ptermin_cmd(
     person5: Optional[discord.Member] = None,
 ):
     await interaction.response.defer(ephemeral=True)
+
     try:
         dt = parse_date_time(datum, uhrzeit)
     except Exception:
@@ -284,6 +328,7 @@ async def ptermin_cmd(
         return
 
     reminders = parse_reminders(erinnerung)
+
     ids = {interaction.user.id}
     for p in (person1, person2, person3, person4, person5):
         if p:
@@ -291,7 +336,6 @@ async def ptermin_cmd(
 
     data = load_data()
     eid = new_id(data)
-
     data["events"].append({
         "id": eid,
         "title": titel,
@@ -315,8 +359,9 @@ async def termine_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     data = load_data()
     now = now_berlin()
+
     events = [e for e in data["events"] if not e.get("cancelled", False) and dt_from_iso(e["datetime"]) >= now]
-    events.sort(key=lambda x: dt_from_iso(x["datetime"]))
+    events.sort(key=lambda e: dt_from_iso(e["datetime"]))
 
     if not events:
         await interaction.followup.send("📭 Keine aktiven Termine.", ephemeral=True)
@@ -326,16 +371,14 @@ async def termine_cmd(interaction: discord.Interaction):
     for e in events[:25]:
         dt = dt_from_iso(e["datetime"])
         rems = ",".join(str(m) for m in e.get("reminders", [])) or "—"
-        lines.append(
-            f"**{e['id']}** · {dt.strftime('%d.%m.%Y %H:%M')} · **{e['title']}** · rem: {rems} · {e.get('recurrence','none')} · {e['target']['type']}"
-        )
+        lines.append(f"**{e['id']}** · {dt.strftime('%d.%m.%Y %H:%M')} · **{e['title']}** · rem: {rems} · {e.get('recurrence','none')} · {e['target']['type']}")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="termine_all", description="Zeigt alle Termine (auch alte/abgesagte)")
 async def termine_all_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     data = load_data()
-    events = sorted(data["events"], key=lambda x: dt_from_iso(x["datetime"]))
+    events = sorted(data["events"], key=lambda e: dt_from_iso(e["datetime"]))
 
     if not events:
         await interaction.followup.send("📭 Keine Termine gespeichert.", ephemeral=True)
@@ -346,9 +389,7 @@ async def termine_all_cmd(interaction: discord.Interaction):
         dt = dt_from_iso(e["datetime"])
         rems = ",".join(str(m) for m in e.get("reminders", [])) or "—"
         status = "abgesagt/erledigt" if e.get("cancelled", False) else "aktiv"
-        lines.append(
-            f"**{e['id']}** · {dt.strftime('%d.%m.%Y %H:%M')} · **{e['title']}** · rem: {rems} · {e.get('recurrence','none')} · {e['target']['type']} · {status}"
-        )
+        lines.append(f"**{e['id']}** · {dt.strftime('%d.%m.%Y %H:%M')} · **{e['title']}** · rem: {rems} · {e.get('recurrence','none')} · {e['target']['type']} · {status}")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 @bot.tree.command(name="termin_absagen", description="Sagt einen Termin ab (per ID)")
@@ -386,6 +427,7 @@ async def termin_edit_cmd(
     await interaction.response.defer(ephemeral=True)
     data = load_data()
     ev = next((e for e in data["events"] if int(e.get("id", -1)) == int(termin_id) and not e.get("cancelled", False)), None)
+
     if ev is None:
         await interaction.followup.send("❌ Termin-ID nicht gefunden.", ephemeral=True)
         return
@@ -415,10 +457,8 @@ async def termin_edit_cmd(
     save_data(data)
     await interaction.followup.send(f"✅ Termin **{termin_id}** aktualisiert.", ephemeral=True)
 
-async def main():
-    async with bot:
-        bot.loop.create_task(reminder_loop())
-        await bot.start(BOT_TOKEN)
-
+# =========================
+# Start
+# =========================
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot.run(BOT_TOKEN)
