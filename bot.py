@@ -310,7 +310,7 @@ async def help_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="ping", description="Testet ob der Bot online ist")
 async def ping_cmd(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
-    await interaction.response.send_message(f"🏓 Pong! Latenz: `{latency} ms`", ephemeral=True)
+    await interaction.response.send_message(f" Bin Online du Hond Latenz: `{latency} ms`", ephemeral=True)
 
 # =========================
 # SLASH: Termine
