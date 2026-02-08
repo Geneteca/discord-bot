@@ -1,503 +1,462 @@
-import os
+import discord
+from discord.ext import commands
 import json
+import os
 import asyncio
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, List
+import re
 
-import discord
-from discord import app_commands
-
-# =========================
-# ENV / KONFIG
-# =========================
+# ==============================
+# KONFIGURATION (Railway ENV)
+# ==============================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ERINNERUNGS_CHANNEL_ID = int(os.environ["ERINNERUNGS_CHANNEL_ID"])  # Standard-Channel für /termin
+ERINNERUNGS_CHANNEL_ID = int(os.environ["ERINNERUNGS_CHANNEL_ID"])
+ROLLE_ID = int(os.environ["ROLLE_ID"])
+
+# ✅ 15 Minuten Auto-Löschung
+AUTO_DELETE_SECONDS = 900
+
 TZ = ZoneInfo("Europe/Berlin")
+REMINDER_TOKEN_RE = re.compile(r"^\d+(m|h|d)$", re.IGNORECASE)
 
-# Optional: damit Slash-Commands sofort auf deinem Server erscheinen:
-GUILD_ID = int(os.environ["GUILD_ID"]) if os.environ.get("GUILD_ID") else None
+# ==============================
+# BOT SETUP
+# ==============================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "data.json"
-CHECK_INTERVAL_SECONDS = 20  # wie oft geprüft wird
+# ==============================
+# JSON HELPERS
+# ==============================
+def load_json(filename, default):
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-# =========================
-# DATENMODELL
-# =========================
-def _now_berlin() -> datetime:
-    return datetime.now(tz=TZ)
+def save_json(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def _parse_dt_berlin(date_str: str, time_str: str) -> datetime:
-    # date: DD-MM-YYYY, time: HH:MM
-    naive = datetime.strptime(f"{date_str} {time_str}", "%d-%m-%Y %H:%M")
-    return naive.replace(tzinfo=TZ)
+# ==============================
+# TIME PARSING
+# ==============================
+def parse_dt(datum: str, uhrzeit: str) -> datetime:
+    """
+    Akzeptiert:
+      - DD.MM.YYYY HH:MM (neu)
+      - DD-MM-YYYY HH:MM (alt)
+    """
+    s = f"{datum} {uhrzeit}"
+    for fmt in ("%d.%m.%Y %H:%M", "%d-%m-%Y %H:%M"):
+        try:
+            naive = datetime.strptime(s, fmt)
+            return naive.replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    raise ValueError("Ungültiges Datum/Uhrzeit Format")
 
-def _dt_to_iso(dt: datetime) -> str:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TZ)
-    return dt.astimezone(TZ).isoformat()
-
-def _dt_from_iso(s: str) -> datetime:
+def dt_from_iso_any(s: str) -> datetime:
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
     return dt.astimezone(TZ)
 
-def _add_months(dt: datetime, months: int) -> datetime:
-    # simple month increment without extra libs
-    year = dt.year + (dt.month - 1 + months) // 12
-    month = (dt.month - 1 + months) % 12 + 1
-    day = dt.day
-
-    # clamp day to last day of target month
-    # (handle Feb etc.)
-    # compute last day by going to first of next month minus one day
-    if month == 12:
-        next_month = datetime(year + 1, 1, 1, tzinfo=dt.tzinfo)
-    else:
-        next_month = datetime(year, month + 1, 1, tzinfo=dt.tzinfo)
-    last_day = (next_month - timedelta(days=1)).day
-
-    day = min(day, last_day)
-    return dt.replace(year=year, month=month, day=day)
-
-def _next_occurrence(dt: datetime, recurrence: str) -> datetime:
-    # recurrence: "none", "daily", "weekly", "monthly"
-    if recurrence == "daily":
-        return dt + timedelta(days=1)
-    if recurrence == "weekly":
-        return dt + timedelta(weeks=1)
-    if recurrence == "monthly":
-        return _add_months(dt, 1)
-    return dt
-
-def _normalize_reminders(reminders: List[int]) -> List[int]:
-    # minutes BEFORE event, unique, sorted desc? we prefer ascending for readability
-    rem = sorted(set(int(x) for x in reminders if int(x) >= 0))
-    return rem
-
-def load_data() -> dict:
+# ==============================
+# SAFE DELETE
+# ==============================
+async def safe_delete_message(msg: discord.Message, label: str = ""):
+    if msg is None:
+        return
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"events": [], "next_id": 1}
+        await msg.delete()
+    except Exception as e:
+        print(f"❌ Konnte Nachricht nicht löschen {label}: {type(e).__name__}: {e}", flush=True)
 
-def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# ==============================
+# REMINDER PARSING
+# ==============================
+def reminder_token_to_minutes(token: str) -> int:
+    token = token.strip().lower()
+    if token.endswith("m"):
+        return int(token[:-1])
+    if token.endswith("h"):
+        return int(token[:-1]) * 60
+    if token.endswith("d"):
+        return int(token[:-1]) * 1440
+    raise ValueError("Reminder-Format ungültig")
 
-def new_event_id(data: dict) -> int:
-    eid = int(data.get("next_id", 1))
-    data["next_id"] = eid + 1
-    return eid
+def split_title_and_reminders(rest: str):
+    """
+    Erwartet: "<titel...> <rem1> <rem2> ..."
+    Beispiel: "PD Meeting 60m 10m 5m"
+    """
+    tokens = rest.split()
+    if not tokens:
+        raise ValueError("Rest leer")
 
-# =========================
-# DISCORD CLIENT
-# =========================
-class MyBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.guilds = True
-        intents.members = True  # für User-Auswahl in Slash-Commands sehr hilfreich
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+    reminder_tokens = []
+    while tokens and REMINDER_TOKEN_RE.match(tokens[-1]):
+        reminder_tokens.append(tokens.pop())
 
-    async def setup_hook(self):
-        # Sync: sofort in einer Guild, wenn GUILD_ID gesetzt ist, sonst global
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            print(f"✅ Slash-Commands synced to guild {GUILD_ID}", flush=True)
-        else:
-            await self.tree.sync()
-            print("✅ Slash-Commands global synced (kann bis ~1h dauern)", flush=True)
+    if not reminder_tokens:
+        raise ValueError("Keine Reminder-Tokens gefunden (z.B. 30m)")
 
-bot = MyBot()
+    titel = " ".join(tokens).strip()
+    if not titel:
+        raise ValueError("Titel fehlt")
 
-# =========================
-# BACKGROUND CHECKER
-# =========================
-async def send_to_targets(
-    *,
-    client: discord.Client,
-    event: dict,
-    msg_text: str
-) -> None:
-    target_type = event["target"]["type"]  # "channel" oder "dm"
-    if target_type == "channel":
-        channel_id = int(event["target"]["channel_id"])
-        channel = client.get_channel(channel_id)
-        if channel is None:
-            # try fetch
+    minutes = [reminder_token_to_minutes(t) for t in reminder_tokens]
+    minutes = sorted(set(minutes), reverse=True)  # unique + absteigend
+    return titel, minutes
+
+def remove_mention_tokens_from_title(title: str) -> str:
+    # entfernt grob Mention-Tokens aus Titel
+    return re.sub(r"<@!?&?\d+>", "", title).strip()
+
+# ==============================
+# DATA MIGRATION (alte Termine)
+# ==============================
+def migrate_termine(termine: list) -> bool:
+    """
+    Migriert alte Struktur:
+      - erinnerung_min -> erinnerungen_min (list)
+      - gesendet bool -> gesendet_min (list)
+      - abgeschlossen default False
+    """
+    changed = False
+    for t in termine:
+        if "abgeschlossen" not in t:
+            t["abgeschlossen"] = False
+            changed = True
+
+        if "erinnerung_min" in t and "erinnerungen_min" not in t:
             try:
-                channel = await client.fetch_channel(channel_id)
-            except Exception as e:
-                print(f"❌ Channel not found/fetch failed: {channel_id} {e}", flush=True)
-                return
+                m = int(t["erinnerung_min"])
+            except Exception:
+                m = 0
+            t["erinnerungen_min"] = [m] if m > 0 else []
+            changed = True
 
-        await channel.send(msg_text)
+        if isinstance(t.get("gesendet"), bool):
+            if "gesendet_min" not in t:
+                t["gesendet_min"] = list(t.get("erinnerungen_min", [])) if t["gesendet"] else []
+                changed = True
+
+        if "gesendet_min" not in t:
+            t["gesendet_min"] = []
+            changed = True
+
+    return changed
+
+# ==============================
+# READY
+# ==============================
+@bot.event
+async def on_ready():
+    print(f"✅ Bot online als {bot.user}", flush=True)
+    bot.loop.create_task(erinnerungs_loop())
+
+# ==============================
+# BASIC
+# ==============================
+@bot.command()
+async def ping(ctx):
+    await ctx.send("🏓 Pong! Ich funktioniere.", delete_after=AUTO_DELETE_SECONDS)
+    await safe_delete_message(ctx.message, "[user cmd ping]")
+
+# ==============================
+# TODO SYSTEM
+# ==============================
+@bot.command()
+async def todo(ctx, *, text):
+    todos = load_json("todos.json", [])
+    todos.append({"text": text, "done": False})
+    save_json("todos.json", todos)
+
+    await ctx.send(f"✅ To-Do hinzugefügt: **{text}**", delete_after=AUTO_DELETE_SECONDS)
+    await safe_delete_message(ctx.message, "[user cmd todo]")
+
+@bot.command()
+async def todos(ctx):
+    todos = load_json("todos.json", [])
+    if not todos:
+        await ctx.send("🎉 Keine To-Dos vorhanden!", delete_after=AUTO_DELETE_SECONDS)
+        await safe_delete_message(ctx.message, "[user cmd todos]")
         return
 
-    # DM
-    user_ids = [int(x) for x in event["target"].get("user_ids", [])]
-    for uid in user_ids:
-        try:
-            user = client.get_user(uid) or await client.fetch_user(uid)
-            if user:
-                await user.send(msg_text)
-        except Exception as e:
-            print(f"❌ DM failed to {uid}: {e}", flush=True)
+    out = "**📝 To-Do-Liste:**\n"
+    for i, t in enumerate(todos):
+        status = "✅" if t.get("done") else "❌"
+        out += f"{i+1}. {status} {t.get('text','')}\n"
 
-def build_reminder_message(event: dict, minutes_before: int) -> str:
-    title = event["title"]
-    dt = _dt_from_iso(event["datetime"])
-    # optional role mention in channel only? user wants DM or selected persons for private;
-    # for channel variant: we keep it clean without role ping unless you want again.
-    # If you still want role ping, we can add ROLE_ID as env and mention it here.
-    when = dt.strftime("%d.%m.%Y %H:%M")
-    return (
-        f"🔔 **Erinnerung** ({minutes_before} min vorher)\n"
-        f"📌 **{title}**\n"
-        f"🕒 {when} (Berlin)"
+    await ctx.send(out, delete_after=AUTO_DELETE_SECONDS)
+    await safe_delete_message(ctx.message, "[user cmd todos]")
+
+@bot.command()
+async def done(ctx, nummer: int):
+    todos = load_json("todos.json", [])
+    if 1 <= nummer <= len(todos):
+        todos[nummer-1]["done"] = True
+        save_json("todos.json", todos)
+        await ctx.send("🎉 To-Do erledigt!", delete_after=AUTO_DELETE_SECONDS)
+    else:
+        await ctx.send("❌ Ungültige Nummer", delete_after=AUTO_DELETE_SECONDS)
+
+    await safe_delete_message(ctx.message, "[user cmd done]")
+
+# ==============================
+# TERMINE (öffentlich im Channel) - ROLLE PING
+# Beispiel:
+# !termin 08.02.2026 12:00 PD Meeting 60m 10m 5m
+# ==============================
+@bot.command()
+async def termin(ctx, datum, uhrzeit, *, rest):
+    try:
+        titel, reminders_min = split_title_and_reminders(rest)
+    except Exception:
+        await ctx.send(
+            "❌ Format: `!termin 08.02.2026 12:00 PD Meeting 60m 10m 5m`",
+            delete_after=AUTO_DELETE_SECONDS
+        )
+        await safe_delete_message(ctx.message, "[user cmd termin]")
+        return
+
+    try:
+        dt = parse_dt(datum, uhrzeit)
+    except Exception:
+        await ctx.send("❌ Datum/Uhrzeit falsch. Beispiel: `08.02.2026 12:00`", delete_after=AUTO_DELETE_SECONDS)
+        await safe_delete_message(ctx.message, "[user cmd termin]")
+        return
+
+    termine = load_json("termine.json", [])
+    termine.append({
+        "titel": titel,
+        "zeit": dt.isoformat(),
+        "erinnerungen_min": reminders_min,
+        "gesendet_min": [],
+        "abgeschlossen": False,
+        "typ": "channel"
+    })
+    save_json("termine.json", termine)
+
+    rem_txt = ", ".join(f"{m}m" for m in reminders_min)
+
+    # ✅ Rolle wird bei !termin gepingt
+    await ctx.send(
+        f"<@&{ROLLE_ID}> 📅 **Termin gespeichert!**\n"
+        f"📌 {titel}\n"
+        f"🕒 {dt.strftime('%d.%m.%Y %H:%M')} (Berlin)\n"
+        f"🔔 **Erinnerung:** {rem_txt} vorher",
+        delete_after=AUTO_DELETE_SECONDS
     )
+    await safe_delete_message(ctx.message, "[user cmd termin]")
 
-def build_created_message(event: dict) -> str:
-    dt = _dt_from_iso(event["datetime"])
-    when = dt.strftime("%d.%m.%Y %H:%M")
-    rems = ", ".join(f"{m}m" for m in event["reminders_minutes"]) if event["reminders_minutes"] else "—"
-    rec = event["recurrence"]
-    rec_txt = {"none":"einmalig", "daily":"täglich", "weekly":"wöchentlich", "monthly":"monatlich"}.get(rec, rec)
-    return (
-        f"✅ Termin gespeichert (ID **{event['id']}**)\n"
-        f"📌 **{event['title']}**\n"
-        f"🕒 {when} (Berlin)\n"
-        f"⏰ Erinnerungen: {rems}\n"
-        f"🔁 Wiederholung: {rec_txt}"
+# ==============================
+# PRIVATE TERMINE (DM) - KEIN ROLLEN PING
+# Beispiel:
+# !ptermin 08.02.2026 12:00 Arzt 60m 10m @Person2 @Person3
+# ==============================
+@bot.command()
+async def ptermin(ctx, datum, uhrzeit, *, rest):
+    try:
+        titel, reminders_min = split_title_and_reminders(rest)
+    except Exception:
+        await ctx.send(
+            "❌ Format: `!ptermin 08.02.2026 12:00 Titel 60m 10m @Person`",
+            delete_after=AUTO_DELETE_SECONDS
+        )
+        await safe_delete_message(ctx.message, "[user cmd ptermin]")
+        return
+
+    titel = remove_mention_tokens_from_title(titel)
+
+    try:
+        dt = parse_dt(datum, uhrzeit)
+    except Exception:
+        await ctx.send("❌ Datum/Uhrzeit falsch. Beispiel: `08.02.2026 12:00`", delete_after=AUTO_DELETE_SECONDS)
+        await safe_delete_message(ctx.message, "[user cmd ptermin]")
+        return
+
+    user_ids = {ctx.author.id}
+    for m in ctx.message.mentions:
+        user_ids.add(m.id)
+
+    termine = load_json("termine.json", [])
+    termine.append({
+        "titel": titel,
+        "zeit": dt.isoformat(),
+        "erinnerungen_min": reminders_min,
+        "gesendet_min": [],
+        "abgeschlossen": False,
+        "typ": "dm",
+        "user_ids": sorted(list(user_ids))
+    })
+    save_json("termine.json", termine)
+
+    rem_txt = ", ".join(f"{m}m" for m in reminders_min)
+
+    # ✅ kein Rollen-Ping
+    await ctx.send(
+        f"📩 **Privater Termin gespeichert!**\n"
+        f"📌 {titel}\n"
+        f"🕒 {dt.strftime('%d.%m.%Y %H:%M')} (Berlin)\n"
+        f"🔔 **Erinnerung:** {rem_txt} vorher\n"
+        f"👥 Empfänger: {len(user_ids)}",
+        delete_after=AUTO_DELETE_SECONDS
     )
+    await safe_delete_message(ctx.message, "[user cmd ptermin]")
 
-async def reminder_loop():
+# ==============================
+# TERMINE: aktive / alle
+# ==============================
+@bot.command()
+async def termine(ctx):
+    termine = load_json("termine.json", [])
+    changed = migrate_termine(termine)
+    aktive = [t for t in termine if not t.get("abgeschlossen", False)]
+    if changed:
+        save_json("termine.json", termine)
+
+    if not aktive:
+        await ctx.send("📭 Keine aktiven Termine gespeichert.", delete_after=AUTO_DELETE_SECONDS)
+        await safe_delete_message(ctx.message, "[user cmd termine]")
+        return
+
+    out = "**📅 Aktive Termine:**\n"
+    for i, t in enumerate(aktive, start=1):
+        dt = dt_from_iso_any(t["zeit"])
+        typ = "DM" if t.get("typ") == "dm" else "Channel"
+        rems = ", ".join(f"{m}m" for m in t.get("erinnerungen_min", [])) or "—"
+        out += f"{i}. [{typ}] {t.get('titel','')} – {dt.strftime('%d.%m.%Y %H:%M')} – Erinnerung: {rems}\n"
+
+    await ctx.send(out, delete_after=AUTO_DELETE_SECONDS)
+    await safe_delete_message(ctx.message, "[user cmd termine]")
+
+@bot.command()
+async def termine_all(ctx):
+    termine = load_json("termine.json", [])
+    changed = migrate_termine(termine)
+    if changed:
+        save_json("termine.json", termine)
+
+    if not termine:
+        await ctx.send("📭 Keine Termine gespeichert.", delete_after=AUTO_DELETE_SECONDS)
+        await safe_delete_message(ctx.message, "[user cmd termine_all]")
+        return
+
+    out = "**📅 Alle Termine:**\n"
+    for i, t in enumerate(termine, start=1):
+        dt = dt_from_iso_any(t["zeit"])
+        typ = "DM" if t.get("typ") == "dm" else "Channel"
+        status = "✅ abgeschlossen" if t.get("abgeschlossen") else "🟡 aktiv"
+        rems = ", ".join(f"{m}m" for m in t.get("erinnerungen_min", [])) or "—"
+        out += f"{i}. [{typ}] {t.get('titel','')} – {dt.strftime('%d.%m.%Y %H:%M')} – Erinnerung: {rems} – {status}\n"
+
+    await ctx.send(out, delete_after=AUTO_DELETE_SECONDS)
+    await safe_delete_message(ctx.message, "[user cmd termine_all]")
+
+@bot.command()
+async def absagen(ctx, nummer: int):
+    termine = load_json("termine.json", [])
+    changed = migrate_termine(termine)
+
+    if 1 <= nummer <= len(termine):
+        t = termine.pop(nummer - 1)
+        save_json("termine.json", termine)
+        await ctx.send(f"❌ Termin abgesagt: **{t.get('titel','')}**", delete_after=AUTO_DELETE_SECONDS)
+    else:
+        if changed:
+            save_json("termine.json", termine)
+        await ctx.send("❌ Ungültige Nummer", delete_after=AUTO_DELETE_SECONDS)
+
+    await safe_delete_message(ctx.message, "[user cmd absagen]")
+
+# ==============================
+# ERINNERUNGS LOOP (mehrere Erinnerungen)
+# ==============================
+async def erinnerungs_loop():
     await bot.wait_until_ready()
-    print("⏰ Reminder-Loop läuft", flush=True)
+
+    channel = bot.get_channel(ERINNERUNGS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ERINNERUNGS_CHANNEL_ID)
+        except Exception as e:
+            print(f"❌ Erinnerungs-Channel nicht gefunden: {e}", flush=True)
+            return
+
+    print(f"✅ Erinnerungs-Channel gefunden: {channel.name} ({channel.id})", flush=True)
 
     while not bot.is_closed():
         try:
-            data = load_data()
-            events = data.get("events", [])
-            now = _now_berlin()
+            jetzt = datetime.now(tz=TZ)
+            termine = load_json("termine.json", [])
+            changed = migrate_termine(termine)
+            any_change = changed
 
-            changed = False
-
-            for ev in events:
-                if ev.get("cancelled"):
+            for t in termine:
+                if t.get("abgeschlossen", False):
                     continue
 
-                dt = _dt_from_iso(ev["datetime"])
-                # Ensure tracking set
-                ev.setdefault("sent_reminders", [])  # list of minutes already sent for current occurrence
+                dt = dt_from_iso_any(t["zeit"])
 
-                # send reminders
-                for m in ev.get("reminders_minutes", []):
-                    remind_at = dt - timedelta(minutes=int(m))
-                    if now >= remind_at and int(m) not in ev["sent_reminders"] and now < dt + timedelta(hours=24):
-                        msg = build_reminder_message(ev, int(m))
-                        await send_to_targets(client=bot, event=ev, msg_text=msg)
-                        ev["sent_reminders"].append(int(m))
-                        changed = True
+                if jetzt >= dt:
+                    t["abgeschlossen"] = True
+                    any_change = True
+                    continue
 
-                # if event time passed: handle recurrence or mark done
-                if now >= dt:
-                    rec = ev.get("recurrence", "none")
-                    if rec and rec != "none":
-                        next_dt = _next_occurrence(dt, rec)
-                        ev["datetime"] = _dt_to_iso(next_dt)
-                        ev["sent_reminders"] = []
-                        changed = True
-                    else:
-                        # one-time: mark done
-                        ev["cancelled"] = True
-                        changed = True
+                titel = t.get("titel", "Termin")
+                when = dt.strftime("%d.%m.%Y %H:%M")
+                reminders = t.get("erinnerungen_min", [])
+                sent = set(int(x) for x in t.get("gesendet_min", []))
 
-            if changed:
-                save_data(data)
+                for m in reminders:
+                    m = int(m)
+                    if m in sent:
+                        continue
+
+                    erinnerungszeit = dt - timedelta(minutes=m)
+                    if jetzt >= erinnerungszeit:
+                        if t.get("typ") == "dm":
+                            # ✅ DM: kein Rollen-Ping
+                            for uid in t.get("user_ids", []):
+                                try:
+                                    user = bot.get_user(uid) or await bot.fetch_user(uid)
+                                    if user:
+                                        await user.send(
+                                            f"🔔 **Erinnerung** ({m} min vorher)\n"
+                                            f"📌 **{titel}**\n"
+                                            f"🕒 {when} (Berlin)"
+                                        )
+                                except Exception as e:
+                                    print(f"❌ DM fehlgeschlagen an {uid}: {e}", flush=True)
+                        else:
+                            # ✅ Channel: Rolle pingen
+                            await channel.send(
+                                f"<@&{ROLLE_ID}> 🔔 **Erinnerung** ({m} min vorher)\n"
+                                f"📌 **{titel}**\n"
+                                f"🕒 {when} (Berlin)",
+                                delete_after=AUTO_DELETE_SECONDS
+                            )
+
+                        sent.add(m)
+                        t["gesendet_min"] = sorted(list(sent))
+                        any_change = True
+
+            if any_change:
+                save_json("termine.json", termine)
 
         except Exception as e:
-            print(f"❌ Fehler im Reminder-Loop: {type(e).__name__}: {e}", flush=True)
+            print(f"❌ Fehler im Erinnerungs-Loop: {type(e).__name__}: {e}", flush=True)
 
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        await asyncio.sleep(30)
 
-# =========================
-# SLASH COMMANDS
-# =========================
-
-def parse_reminders_string(s: str) -> List[int]:
-    """
-    Erwartet z.B.: "30,10,5" => [30,10,5]
-    oder leer => []
-    """
-    s = (s or "").strip()
-    if not s:
-        return []
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    return _normalize_reminders([int(p) for p in parts])
-
-@app_commands.command(name="termin", description="Termin im festen Channel ankündigen (öffentlich)")
-@app_commands.describe(
-    datum="DD-MM-YYYY (z.B. 08-02-2026)",
-    uhrzeit="HH:MM (z.B. 12:00)",
-    titel="Titel des Termins",
-    erinnerungen="Minuten vorher, Komma-getrennt (z.B. 30,10) – leer = keine",
-    wiederholung="none/daily/weekly/monthly"
-)
-async def termin_cmd(
-    interaction: discord.Interaction,
-    datum: str,
-    uhrzeit: str,
-    titel: str,
-    erinnerungen: str = "30",
-    wiederholung: str = "none"
-):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        dt = _parse_dt_berlin(datum, uhrzeit)
-    except Exception:
-        await interaction.followup.send("❌ Datum/Uhrzeit falsch. Format: `08-02-2026` und `12:00`", ephemeral=True)
-        return
-
-    rec = wiederholung.lower().strip()
-    if rec not in ("none", "daily", "weekly", "monthly"):
-        await interaction.followup.send("❌ wiederholung muss sein: none/daily/weekly/monthly", ephemeral=True)
-        return
-
-    reminders = parse_reminders_string(erinnerungen)
-
-    data = load_data()
-    ev_id = new_event_id(data)
-    event = {
-        "id": ev_id,
-        "title": titel,
-        "datetime": _dt_to_iso(dt),
-        "reminders_minutes": reminders,
-        "sent_reminders": [],
-        "recurrence": rec,
-        "cancelled": False,
-        "target": {
-            "type": "channel",
-            "channel_id": ERINNERUNGS_CHANNEL_ID
-        }
-    }
-    data["events"].append(event)
-    save_data(data)
-
-    # Bestätigung (ephemeral)
-    await interaction.followup.send(build_created_message(event), ephemeral=True)
-
-@app_commands.command(name="ptermin", description="Privater Termin: Erinnerung per DM an dich oder ausgewählte Personen")
-@app_commands.describe(
-    datum="DD-MM-YYYY (z.B. 08-02-2026)",
-    uhrzeit="HH:MM (z.B. 12:00)",
-    titel="Titel des Termins",
-    erinnerungen="Minuten vorher, Komma-getrennt (z.B. 30,10) – leer = keine",
-    wiederholung="none/daily/weekly/monthly",
-    person1="Optional: weitere Person",
-    person2="Optional: weitere Person",
-    person3="Optional: weitere Person",
-    person4="Optional: weitere Person",
-    person5="Optional: weitere Person"
-)
-async def ptermin_cmd(
-    interaction: discord.Interaction,
-    datum: str,
-    uhrzeit: str,
-    titel: str,
-    erinnerungen: str = "30",
-    wiederholung: str = "none",
-    person1: Optional[discord.Member] = None,
-    person2: Optional[discord.Member] = None,
-    person3: Optional[discord.Member] = None,
-    person4: Optional[discord.Member] = None,
-    person5: Optional[discord.Member] = None
-):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        dt = _parse_dt_berlin(datum, uhrzeit)
-    except Exception:
-        await interaction.followup.send("❌ Datum/Uhrzeit falsch. Format: `08-02-2026` und `12:00`", ephemeral=True)
-        return
-
-    rec = wiederholung.lower().strip()
-    if rec not in ("none", "daily", "weekly", "monthly"):
-        await interaction.followup.send("❌ wiederholung muss sein: none/daily/weekly/monthly", ephemeral=True)
-        return
-
-    reminders = parse_reminders_string(erinnerungen)
-
-    # Empfänger: standardmäßig du selbst + optional markierte
-    user_ids = {interaction.user.id}
-    for p in (person1, person2, person3, person4, person5):
-        if p is not None:
-            user_ids.add(p.id)
-
-    data = load_data()
-    ev_id = new_event_id(data)
-    event = {
-        "id": ev_id,
-        "title": titel,
-        "datetime": _dt_to_iso(dt),
-        "reminders_minutes": reminders,
-        "sent_reminders": [],
-        "recurrence": rec,
-        "cancelled": False,
-        "target": {
-            "type": "dm",
-            "user_ids": sorted(list(user_ids))
-        }
-    }
-    data["events"].append(event)
-    save_data(data)
-
-    await interaction.followup.send(build_created_message(event) + "\n📩 Versand: DM", ephemeral=True)
-
-@app_commands.command(name="termine", description="Zeigt kommende Termine (mit IDs) an")
-async def termine_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    events = [e for e in data.get("events", []) if not e.get("cancelled")]
-
-    now = _now_berlin()
-    # sort by date
-    events.sort(key=lambda e: _dt_from_iso(e["datetime"]))
-
-    if not events:
-        await interaction.followup.send("📭 Keine Termine gespeichert.", ephemeral=True)
-        return
-
-    lines = []
-    for e in events[:25]:
-        dt = _dt_from_iso(e["datetime"])
-        if dt < now - timedelta(days=1):
-            continue
-        rec = e.get("recurrence", "none")
-        rec_txt = {"none":"einmalig", "daily":"täglich", "weekly":"wöchentlich", "monthly":"monatlich"}.get(rec, rec)
-        rems = ",".join(str(m) for m in e.get("reminders_minutes", [])) or "—"
-        target = e["target"]["type"]
-        lines.append(f"**{e['id']}** · {dt.strftime('%d.%m.%Y %H:%M')} · **{e['title']}** · rem: {rems} · {rec_txt} · {target}")
-
-    out = "\n".join(lines) if lines else "📭 Keine (aktuellen) Termine."
-    await interaction.followup.send(out, ephemeral=True)
-
-@app_commands.command(name="termin_absagen", description="Löscht/stoppt einen Termin (per ID)")
-@app_commands.describe(termin_id="ID aus /termine")
-async def termin_absagen_cmd(interaction: discord.Interaction, termin_id: int):
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    events = data.get("events", [])
-    found = False
-    for e in events:
-        if int(e.get("id", -1)) == int(termin_id) and not e.get("cancelled"):
-            e["cancelled"] = True
-            found = True
-            break
-
-    if found:
-        save_data(data)
-        await interaction.followup.send(f"❌ Termin **{termin_id}** abgesagt.", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ ID nicht gefunden oder schon abgesagt.", ephemeral=True)
-
-@app_commands.command(name="termin_edit", description="Bearbeitet einen Termin (per ID)")
-@app_commands.describe(
-    termin_id="ID aus /termine",
-    datum="Optional: DD-MM-YYYY",
-    uhrzeit="Optional: HH:MM",
-    titel="Optional: neuer Titel",
-    erinnerungen="Optional: z.B. 60,10",
-    wiederholung="Optional: none/daily/weekly/monthly"
-)
-async def termin_edit_cmd(
-    interaction: discord.Interaction,
-    termin_id: int,
-    datum: Optional[str] = None,
-    uhrzeit: Optional[str] = None,
-    titel: Optional[str] = None,
-    erinnerungen: Optional[str] = None,
-    wiederholung: Optional[str] = None
-):
-    await interaction.response.defer(ephemeral=True)
-
-    data = load_data()
-    events = data.get("events", [])
-    ev = None
-    for e in events:
-        if int(e.get("id", -1)) == int(termin_id) and not e.get("cancelled"):
-            ev = e
-            break
-
-    if ev is None:
-        await interaction.followup.send("❌ Termin-ID nicht gefunden.", ephemeral=True)
-        return
-
-    # update title
-    if titel is not None and titel.strip():
-        ev["title"] = titel.strip()
-
-    # update recurrence
-    if wiederholung is not None:
-        rec = wiederholung.lower().strip()
-        if rec not in ("none", "daily", "weekly", "monthly"):
-            await interaction.followup.send("❌ wiederholung muss sein: none/daily/weekly/monthly", ephemeral=True)
-            return
-        ev["recurrence"] = rec
-
-    # update reminders
-    if erinnerungen is not None:
-        ev["reminders_minutes"] = parse_reminders_string(erinnerungen)
-        ev["sent_reminders"] = []  # reset for safety
-
-    # update date/time (need both if one is missing we use existing)
-    if datum is not None or uhrzeit is not None:
-        current_dt = _dt_from_iso(ev["datetime"])
-        d = datum if datum is not None else current_dt.strftime("%d-%m-%Y")
-        t = uhrzeit if uhrzeit is not None else current_dt.strftime("%H:%M")
-        try:
-            new_dt = _parse_dt_berlin(d, t)
-        except Exception:
-            await interaction.followup.send("❌ Neues Datum/Uhrzeit ungültig.", ephemeral=True)
-            return
-        ev["datetime"] = _dt_to_iso(new_dt)
-        ev["sent_reminders"] = []
-
-    save_data(data)
-    await interaction.followup.send("✅ Termin aktualisiert:\n" + build_created_message(ev), ephemeral=True)
-
-# Register commands
-bot.tree.add_command(termin_cmd)
-bot.tree.add_command(ptermin_cmd)
-bot.tree.add_command(termine_cmd)
-bot.tree.add_command(termin_absagen_cmd)
-bot.tree.add_command(termin_edit_cmd)
-
-# =========================
-# STARTUP
-# =========================
-@bot.event
-async def on_connect():
-    print("🔌 Connected", flush=True)
-
-@bot.event
-async def on_disconnect():
-    print("🔌 Disconnected", flush=True)
-
-async def main():
-    async with bot:
-        bot.loop.create_task(reminder_loop())
-        await bot.start(BOT_TOKEN)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# ==============================
+# START
+# ==============================
+bot.run(BOT_TOKEN)
