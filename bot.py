@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import json
 import os
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo  # Python 3.9+
 
@@ -13,7 +14,7 @@ ERINNERUNGS_CHANNEL_ID = int(os.environ["ERINNERUNGS_CHANNEL_ID"])
 ROLLE_ID = int(os.environ["ROLLE_ID"])
 
 AUTO_DELETE_SECONDS = 300
-TZ = ZoneInfo("Europe/Berlin")  # <- wichtig: Berlin-Zeit
+TZ = ZoneInfo("Europe/Berlin")  # Sommer-/Winterzeit wird automatisch berücksichtigt
 
 # ==============================
 # BOT SETUP
@@ -47,13 +48,11 @@ async def safe_delete_message(msg: discord.Message, label: str = ""):
     except discord.Forbidden as e:
         print(f"❌ Forbidden beim Löschen {label}: {e}", flush=True)
     except discord.NotFound:
-        # Nachricht existiert nicht mehr – ok
         pass
     except Exception as e:
         print(f"❌ Fehler beim Löschen {label}: {type(e).__name__}: {e}", flush=True)
 
 async def send_temp(ctx, content: str):
-    # delete_after löscht automatisch, ohne unseren Eventloop zu blockieren
     return await ctx.send(content, delete_after=AUTO_DELETE_SECONDS)
 
 def parse_reminder_to_minutes(token: str) -> int:
@@ -67,10 +66,19 @@ def parse_reminder_to_minutes(token: str) -> int:
     raise ValueError("Reminder format invalid")
 
 def parse_berlin_datetime(datum: str, uhrzeit: str) -> datetime:
-    # datum: DD-MM-YYYY, uhrzeit: HH:MM
     naive = datetime.strptime(f"{datum} {uhrzeit}", "%d-%m-%Y %H:%M")
-    # als Berlin-Zeit interpretieren
+    # Als lokale Berlin-Zeit interpretieren (ZoneInfo berechnet Offset inkl. DST)
     return naive.replace(tzinfo=TZ)
+
+def parse_iso_any(dt_str: str) -> datetime:
+    """
+    Liest ISO-Zeit aus JSON.
+    - Wenn Zeitzone fehlt (alte Daten), behandeln wir sie als Europe/Berlin.
+    """
+    dt = datetime.fromisoformat(dt_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt
 
 # ==============================
 # READY EVENT
@@ -154,8 +162,7 @@ async def termin(ctx, datum, uhrzeit, *, rest):
     termine = load_json("termine.json", [])
     termine.append({
         "titel": titel,
-        # ISO mit Zeitzone
-        "zeit": terminzeit_berlin.isoformat(),
+        "zeit": terminzeit_berlin.isoformat(),  # enthält Offset (z.B. +01:00 / +02:00)
         "erinnerung": minuten,
         "gesendet": False
     })
@@ -165,7 +172,7 @@ async def termin(ctx, datum, uhrzeit, *, rest):
         ctx,
         f"📅 **Termin gespeichert!**\n"
         f"📌 {titel}\n"
-        f"⏰ {datum} {uhrzeit} (Berlin)\n"
+        f"⏰ {datum} {uhrzeit} (Europe/Berlin)\n"
         f"🔔 {minuten} Minuten vorher"
     )
     await safe_delete_message(ctx.message, label="[user cmd termin]")
@@ -180,10 +187,8 @@ async def termine(ctx):
 
     out = "**📅 Termine:**\n"
     for i, t in enumerate(termine):
-        zeit = datetime.fromisoformat(t["zeit"])
-        # Anzeige in Berlin
-        zeit_berlin = zeit.astimezone(TZ)
-        out += f"{i+1}. {t['titel']} – {zeit_berlin.strftime('%d.%m %H:%M')} (Berlin)\n"
+        zeit = parse_iso_any(t["zeit"]).astimezone(TZ)
+        out += f"{i+1}. {t['titel']} – {zeit.strftime('%d.%m %H:%M')} (Berlin)\n"
 
     await send_temp(ctx, out)
     await safe_delete_message(ctx.message, label="[user cmd termine]")
@@ -215,7 +220,7 @@ async def erinnerungs_task():
 
     while not bot.is_closed():
         try:
-            jetzt = datetime.now(tz=TZ)  # Berlin-Zeit!
+            jetzt = datetime.now(tz=TZ)  # Berlin-Zeit
             termine = load_json("termine.json", [])
             geändert = False
 
@@ -223,23 +228,17 @@ async def erinnerungs_task():
                 if t.get("gesendet"):
                     continue
 
-                terminzeit = datetime.fromisoformat(t["zeit"])
-                terminzeit_berlin = terminzeit.astimezone(TZ)
-
-                erinnerungszeit = terminzeit_berlin - timedelta(minutes=int(t["erinnerung"]))
+                terminzeit = parse_iso_any(t["zeit"]).astimezone(TZ)
+                erinnerungszeit = terminzeit - timedelta(minutes=int(t["erinnerung"]))
 
                 if jetzt >= erinnerungszeit:
-                    # send + auto delete nach 5 min (ohne sleep)
-                    try:
-                        await channel.send(
-                            f"<@&{ROLLE_ID}> 🔔 **ERINNERUNG** 🔔\n"
-                            f"📌 **{t['titel']}**\n"
-                            f"⏰ Termin um {terminzeit_berlin.strftime('%H:%M')} (Berlin)",
-                            delete_after=AUTO_DELETE_SECONDS
-                        )
-                        print(f"🔔 Erinnerung gesendet: {t['titel']} ({terminzeit_berlin})", flush=True)
-                    except Exception as e:
-                        print(f"❌ Fehler beim Senden der Erinnerung: {type(e).__name__}: {e}", flush=True)
+                    await channel.send(
+                        f"<@&{ROLLE_ID}> 🔔 **ERINNERUNG** 🔔\n"
+                        f"📌 **{t['titel']}**\n"
+                        f"⏰ Termin um {terminzeit.strftime('%H:%M')} (Berlin)",
+                        delete_after=AUTO_DELETE_SECONDS
+                    )
+                    print(f"🔔 Erinnerung gesendet: {t['titel']} -> {terminzeit.isoformat()}", flush=True)
 
                     t["gesendet"] = True
                     geändert = True
@@ -250,12 +249,9 @@ async def erinnerungs_task():
         except Exception as e:
             print(f"❌ Fehler im Erinnerungs-Loop: {type(e).__name__}: {e}", flush=True)
 
-        # alle 30s prüfen, damit 1-min-Tests zuverlässig sind
-        await asyncio.sleep(30)
+        await asyncio.sleep(30)  # öfter prüfen, damit Tests schneller sind
 
 # ==============================
 # START
 # ==============================
 bot.run(BOT_TOKEN)
-
-
