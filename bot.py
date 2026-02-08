@@ -1,9 +1,9 @@
 import discord
 from discord.ext import commands
 import json
-import asyncio
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 # ==============================
 # KONFIGURATION (Railway ENV)
@@ -12,8 +12,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ERINNERUNGS_CHANNEL_ID = int(os.environ["ERINNERUNGS_CHANNEL_ID"])
 ROLLE_ID = int(os.environ["ROLLE_ID"])
 
-# Nachrichten nach X Sekunden löschen (5 Minuten)
 AUTO_DELETE_SECONDS = 300
+TZ = ZoneInfo("Europe/Berlin")  # <- wichtig: Berlin-Zeit
 
 # ==============================
 # BOT SETUP
@@ -27,59 +27,68 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ==============================
 def load_json(filename, default):
     try:
-        with open(filename, "r") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
 def save_json(filename, data):
-    with open(filename, "w") as f:
-        json.dump(data, f, indent=2)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 # ==============================
-# HILFSFUNKTIONEN (DEBUG-SAFE)
+# HILFSFUNKTIONEN
 # ==============================
 async def safe_delete_message(msg: discord.Message, label: str = ""):
-    """Versucht eine Nachricht zu löschen und loggt Fehler in Railway."""
     if msg is None:
         return
     try:
         await msg.delete()
+    except discord.Forbidden as e:
+        print(f"❌ Forbidden beim Löschen {label}: {e}", flush=True)
+    except discord.NotFound:
+        # Nachricht existiert nicht mehr – ok
+        pass
     except Exception as e:
-        print(f"❌ Konnte Nachricht nicht löschen {label}: {type(e).__name__}: {e}")
+        print(f"❌ Fehler beim Löschen {label}: {type(e).__name__}: {e}", flush=True)
 
 async def send_temp(ctx, content: str):
-    """Sendet eine Nachricht und löscht sie nach AUTO_DELETE_SECONDS."""
-    msg = await ctx.send(content)
-    try:
-        await asyncio.sleep(AUTO_DELETE_SECONDS)
-        await safe_delete_message(msg, label="[bot reply]")
-    except Exception as e:
-        print(f"❌ Fehler beim Auto-Delete der Bot-Nachricht: {type(e).__name__}: {e}")
+    # delete_after löscht automatisch, ohne unseren Eventloop zu blockieren
+    return await ctx.send(content, delete_after=AUTO_DELETE_SECONDS)
+
+def parse_reminder_to_minutes(token: str) -> int:
+    token = token.strip().lower()
+    if token.endswith("m"):
+        return int(token[:-1])
+    if token.endswith("h"):
+        return int(token[:-1]) * 60
+    if token.endswith("d"):
+        return int(token[:-1]) * 1440
+    raise ValueError("Reminder format invalid")
+
+def parse_berlin_datetime(datum: str, uhrzeit: str) -> datetime:
+    # datum: DD-MM-YYYY, uhrzeit: HH:MM
+    naive = datetime.strptime(f"{datum} {uhrzeit}", "%d-%m-%Y %H:%M")
+    # als Berlin-Zeit interpretieren
+    return naive.replace(tzinfo=TZ)
 
 # ==============================
 # READY EVENT
 # ==============================
 @bot.event
 async def on_ready():
-    print(f"✅ Bot online als {bot.user}")
-    try:
-        bot.loop.create_task(erinnerungs_task())
-        print("⏰ Erinnerungs-Task gestartet")
-    except Exception as e:
-        print(f"❌ Fehler beim Starten des Erinnerungs-Tasks: {type(e).__name__}: {e}")
+    print(f"✅ Bot online als {bot.user}", flush=True)
+    bot.loop.create_task(erinnerungs_task())
+    print("⏰ Erinnerungs-Task gestartet", flush=True)
 
 # ==============================
-# TEST COMMAND
+# COMMANDS
 # ==============================
 @bot.command()
 async def ping(ctx):
     await send_temp(ctx, "🏓 Pong! Ich funktioniere.")
     await safe_delete_message(ctx.message, label="[user cmd ping]")
 
-# ==============================
-# TODO SYSTEM
-# ==============================
 @bot.command()
 async def todo(ctx, *, text):
     todos = load_json("todos.json", [])
@@ -117,19 +126,6 @@ async def done(ctx, nummer: int):
 
     await safe_delete_message(ctx.message, label="[user cmd done]")
 
-# ==============================
-# TERMIN SYSTEM (DD-MM-YYYY)
-# ==============================
-def parse_reminder_to_minutes(token: str):
-    token = token.strip().lower()
-    if token.endswith("m"):
-        return int(token[:-1])
-    if token.endswith("h"):
-        return int(token[:-1]) * 60
-    if token.endswith("d"):
-        return int(token[:-1]) * 1440
-    raise ValueError("Reminder format invalid")
-
 @bot.command()
 async def termin(ctx, datum, uhrzeit, *, rest):
     teile = rest.split()
@@ -149,7 +145,7 @@ async def termin(ctx, datum, uhrzeit, *, rest):
         return
 
     try:
-        terminzeit = datetime.strptime(f"{datum} {uhrzeit}", "%d-%m-%Y %H:%M")
+        terminzeit_berlin = parse_berlin_datetime(datum, uhrzeit)
     except Exception:
         await send_temp(ctx, "❌ Falsches Datum/Uhrzeit! Beispiel: `08-02-2026 12:00`")
         await safe_delete_message(ctx.message, label="[user cmd termin]")
@@ -158,7 +154,8 @@ async def termin(ctx, datum, uhrzeit, *, rest):
     termine = load_json("termine.json", [])
     termine.append({
         "titel": titel,
-        "zeit": terminzeit.isoformat(),
+        # ISO mit Zeitzone
+        "zeit": terminzeit_berlin.isoformat(),
         "erinnerung": minuten,
         "gesendet": False
     })
@@ -168,7 +165,7 @@ async def termin(ctx, datum, uhrzeit, *, rest):
         ctx,
         f"📅 **Termin gespeichert!**\n"
         f"📌 {titel}\n"
-        f"⏰ {datum} {uhrzeit}\n"
+        f"⏰ {datum} {uhrzeit} (Berlin)\n"
         f"🔔 {minuten} Minuten vorher"
     )
     await safe_delete_message(ctx.message, label="[user cmd termin]")
@@ -184,7 +181,9 @@ async def termine(ctx):
     out = "**📅 Termine:**\n"
     for i, t in enumerate(termine):
         zeit = datetime.fromisoformat(t["zeit"])
-        out += f"{i+1}. {t['titel']} – {zeit.strftime('%d.%m %H:%M')}\n"
+        # Anzeige in Berlin
+        zeit_berlin = zeit.astimezone(TZ)
+        out += f"{i+1}. {t['titel']} – {zeit_berlin.strftime('%d.%m %H:%M')} (Berlin)\n"
 
     await send_temp(ctx, out)
     await safe_delete_message(ctx.message, label="[user cmd termine]")
@@ -202,21 +201,21 @@ async def absagen(ctx, nummer: int):
     await safe_delete_message(ctx.message, label="[user cmd absagen]")
 
 # ==============================
-# ERINNERUNGEN (ROLLE PING + AUTO-DELETE)
+# ERINNERUNGEN
 # ==============================
 async def erinnerungs_task():
     await bot.wait_until_ready()
     channel = bot.get_channel(ERINNERUNGS_CHANNEL_ID)
 
     if channel is None:
-        print("❌ Erinnerungs-Channel nicht gefunden. Prüfe ERINNERUNGS_CHANNEL_ID!")
+        print("❌ Erinnerungs-Channel nicht gefunden. Prüfe ERINNERUNGS_CHANNEL_ID!", flush=True)
         return
 
-    print(f"✅ Erinnerungs-Channel gefunden: {channel.name} ({channel.id})")
+    print(f"✅ Erinnerungs-Channel gefunden: {channel.name} ({channel.id})", flush=True)
 
     while not bot.is_closed():
         try:
-            jetzt = datetime.now()
+            jetzt = datetime.now(tz=TZ)  # Berlin-Zeit!
             termine = load_json("termine.json", [])
             geändert = False
 
@@ -225,20 +224,22 @@ async def erinnerungs_task():
                     continue
 
                 terminzeit = datetime.fromisoformat(t["zeit"])
-                erinnerungszeit = terminzeit - timedelta(minutes=int(t["erinnerung"]))
+                terminzeit_berlin = terminzeit.astimezone(TZ)
+
+                erinnerungszeit = terminzeit_berlin - timedelta(minutes=int(t["erinnerung"]))
 
                 if jetzt >= erinnerungszeit:
+                    # send + auto delete nach 5 min (ohne sleep)
                     try:
-                        msg = await channel.send(
+                        await channel.send(
                             f"<@&{ROLLE_ID}> 🔔 **ERINNERUNG** 🔔\n"
                             f"📌 **{t['titel']}**\n"
-                            f"⏰ Termin um {terminzeit.strftime('%H:%M')}"
+                            f"⏰ Termin um {terminzeit_berlin.strftime('%H:%M')} (Berlin)",
+                            delete_after=AUTO_DELETE_SECONDS
                         )
-                        # nach 5 Minuten löschen
-                        await asyncio.sleep(AUTO_DELETE_SECONDS)
-                        await safe_delete_message(msg, label="[reminder msg]")
+                        print(f"🔔 Erinnerung gesendet: {t['titel']} ({terminzeit_berlin})", flush=True)
                     except Exception as e:
-                        print(f"❌ Fehler beim Senden/Löschen der Erinnerung: {type(e).__name__}: {e}")
+                        print(f"❌ Fehler beim Senden der Erinnerung: {type(e).__name__}: {e}", flush=True)
 
                     t["gesendet"] = True
                     geändert = True
@@ -247,12 +248,14 @@ async def erinnerungs_task():
                 save_json("termine.json", termine)
 
         except Exception as e:
-            print(f"❌ Fehler im Erinnerungs-Loop: {type(e).__name__}: {e}")
+            print(f"❌ Fehler im Erinnerungs-Loop: {type(e).__name__}: {e}", flush=True)
 
-        await asyncio.sleep(60)
+        # alle 30s prüfen, damit 1-min-Tests zuverlässig sind
+        await asyncio.sleep(30)
 
 # ==============================
-# BOT STARTEN
+# START
 # ==============================
 bot.run(BOT_TOKEN)
+
 
