@@ -501,3 +501,9 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+@bot.event
+async def on_ready():
+    guild = discord.Object(id=GUILD_ID)
+    await bot.tree.clear_commands(guild=None)  # ❗ löscht globale Commands
+    await bot.tree.sync()
+    print("🧹 Globale Slash-Commands gelöscht")
